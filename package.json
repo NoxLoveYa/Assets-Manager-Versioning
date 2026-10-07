@@ -1,0 +1,15 @@
+{
+  "name": "assets-manager-versioning",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Versioning for Roblox asset folders: a Studio plugin plus Rojo and git.",
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "plugin:build": "rojo build plugin.project.json -o build/AssetVersioning.rbxm",
+    "plugin:install": "node scripts/setup.js --plugin-only",
+    "save": "node scripts/save.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
