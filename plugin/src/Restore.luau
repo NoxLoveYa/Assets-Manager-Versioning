@@ -1,5 +1,5 @@
--- Rebuilds a folder from its snapshot. Matches instances by id so existing ones are updated in
--- place instead of being recreated.
+-- Rebuilds a folder from a saved version. Matches instances by id so existing ones are updated
+-- in place instead of being recreated.
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local SerializationService = game:GetService("SerializationService")
@@ -11,17 +11,15 @@ local Util = require(script.Parent.Util)
 
 local Restore = {}
 
-local function loadNodes(pkg: string)
+local function loadNodes(pkg: string, tree)
+	local index = Store.objects(pkg)
 	local nodes, unreadable = {}, {}
-	for _, rec in Store.read(pkg) do
-		local ok, data = pcall(function()
-			-- A clone has no require cache, so edits made by Rojo/git are picked up.
-			return require(rec.module:Clone())
-		end)
-		if ok and type(data) == "table" and type(data.id) == "string" then
-			nodes[data.id] = data
+	for id, entry in tree do
+		local data = Store.loadObject(index, entry.h)
+		if data then
+			nodes[id] = data
 		else
-			table.insert(unreadable, rec.label)
+			table.insert(unreadable, entry.n)
 		end
 	end
 	return nodes, unreadable
@@ -153,8 +151,8 @@ end
 
 -- Yields. existingRoot is the live folder, or nil to create it from scratch.
 -- Returns { ok = true, failures = {...}, unreadable = {...} } or { ok = false, message }.
-function Restore.run(pkg: string, existingRoot: Instance?)
-	local nodes, unreadable = loadNodes(pkg)
+function Restore.run(pkg: string, existingRoot: Instance?, tree)
+	local nodes, unreadable = loadNodes(pkg, tree)
 
 	local rootData
 	for _, d in nodes do
@@ -163,7 +161,7 @@ function Restore.run(pkg: string, existingRoot: Instance?)
 		end
 	end
 	if not rootData then
-		return { ok = false, message = "This snapshot has no main folder file, so there is nothing to restore." }
+		return { ok = false, message = "This version has no main folder, so there is nothing to restore." }
 	end
 
 	local recording = ChangeHistoryService:TryBeginRecording("Restore snapshot")

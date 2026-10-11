@@ -1,38 +1,52 @@
-# Asset Versioning
+# Asset Versioning (Roblox-only)
 
-Version your Roblox asset folders per place: see what changed, go back, and merge work between places. A replacement for Package links built on **a Studio plugin + Rojo + git**.
+Version your Roblox asset folders per place: save versions, see what changed, go back, and combine work from different places. A replacement for Package links that lives **entirely inside Roblox Studio**. No Rojo, git or Node needed to use it.
 
-## Set up (once)
+> The git + Rojo version is on the [`v0.1`](../../tree/v0.1) branch.
 
-Needs [Node.js](https://nodejs.org) and [Rojo](https://rojo.space) (already on your PATH if you use Rojo).
+## Install (once)
 
-1. Double-click **`Setup.bat`**.
-2. It installs the Studio plugin, then asks for your Rojo project folder (drag it into the window). It connects the project and adds **`Save Versions.bat`** to it.
-3. Commit the new files in your project. Teammates only need to run `Setup.bat` once to get the plugin.
-4. Restart Studio. The **Asset Versioning** button is in the Plugins tab.
+1. Download [`dist/AssetVersioning.rbxm`](dist/AssetVersioning.rbxm).
+2. Put it in Studio's plugins folder: **Plugins tab > Plugins Folder**, then drop the file in.
+3. Restart Studio. The **Asset Versioning** button is in the Plugins tab.
 
-## Everyday use (artists)
+## Everyday use
 
-1. Open the **Asset Versioning** panel, click your asset folder in the Explorer, press **Track this folder**.
-2. Work as usual. The panel shows whether the folder differs from the last snapshot and lists what changed.
-3. **Save snapshot** when you're happy. **Restore snapshot** goes back (Ctrl+Z undoes it).
-4. To share: save the place (Ctrl+S), then double-click **`Save Versions.bat`** in the project folder.
+1. Open the panel, click your asset folder in the Explorer, press **Track this folder**. The first version is saved for you.
+2. Work as usual. The panel shows whether the folder differs from your latest version and lists what changed (**See changes**).
+3. **Save version** when you're happy (add a short note if you like).
+4. **History** lists past versions. **What changed** shows the difference, **Go back to this** puts the folder back (Ctrl+Z undoes it).
+5. **Discard changes** throws away unsaved work and returns to the latest version.
 
-Another place's work arrives through git (branch per place, merge as usual). Once Rojo syncs it, the panel shows it under **Found in your project** (or as differences on a tracked folder, then press **Restore snapshot**).
+## Several places
+
+Each place keeps its own *line* of versions, named after the place. To share:
+
+- **Same Team Create place:** nothing to do, the history is shared automatically.
+- **Different places:** press **Export to file** on a folder, open the other place, press **Import a file**, then either **Add to this place** (new folder) or **Combine with another line** (existing folder).
+
+Combining merges item by item: changes to different items, or to different properties of the same item, merge on their own. If both places changed the same property of the same item, you pick **Keep mine** or **Use theirs** for that item. Save a version before combining so nothing is lost.
 
 ## How it works
 
-- The plugin writes each instance of a tracked folder as a small ModuleScript (`ServerStorage/AssetVersioning/<Folder>/<Name>~<id>`), with sorted properties so diffs stay small. Instances are matched by an `AssetVersioningId` attribute the plugin adds.
-- Rojo maps that folder to `asset-versions/`. Rojo can't write Studio changes to disk live, so `Save Versions.bat` runs `rojo syncback` against the saved place (only the snapshot folder is touched) and records it in git.
-- Merging is plain git on those files. Editing different items never conflicts.
+History is stored in the place itself, under `ServerStorage/AssetVersioning/<Folder>/`:
+
+| Folder | Holds |
+| --- | --- |
+| `Objects` | one ModuleScript per distinct item, named by content hash (unchanged items are stored once) |
+| `Commits` | one folder per version: note, author, time, parent version(s) and the list of items |
+| `Branches` | the latest version of each line of work |
+
+Items are matched across versions by an `AssetVersioningId` attribute the plugin adds, so renames and moves show up as changes, not delete-and-add.
+
+## Things to know
+
+- **Only import files from people you trust.** Versions are ModuleScripts that the plugin runs to read them.
+- The history ships with the place when you publish. Delete `ServerStorage/AssetVersioning` from a release build if you don't want it there.
+- Unions are stored as opaque shape data: they version, but two edits of the same union conflict. Script source is merged as a whole (no line-level merge): if two places edited the same script, you choose one.
+- Properties of unsupported types (e.g. `Vector3int16`) and references to instances outside the tracked folder are not saved. Anything a plugin can't set is reported after a restore.
+- Old versions are never deleted, so the history only grows.
 
 ## Developing
 
-- `npm run plugin:build` builds `build/AssetVersioning.rbxm`; `npm run plugin:install` installs it for Studio.
-- `scripts/save.js` is copied into each project by `scripts/setup.js`; re-run Setup to update it.
-
-## Known limits
-
-- Unions are stored as opaque shape data: they version, but two edits of the same union conflict.
-- Properties of unsupported types (e.g. `Vector3int16`) and references to instances outside the tracked folder are not saved.
-- Anything a plugin can't set (some mesh/read-only properties) is reported after a restore.
+`rojo build plugin.project.json -o dist/AssetVersioning.rbxm` rebuilds the plugin (needs [Rojo](https://rojo.space)). Source is in `plugin/src`.

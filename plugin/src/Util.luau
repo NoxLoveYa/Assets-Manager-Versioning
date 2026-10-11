@@ -32,6 +32,52 @@ function Util.norm(s: string): string
 	return out
 end
 
+-- 64-bit content hash (two 32-bit hashes) as 16 hex characters. Identical text gives an
+-- identical name, which is how unchanged items are stored only once across versions.
+function Util.hash(s: string): string
+	local h1, h2 = 2166136261, 5381
+	local len, i = #s, 1
+	while i <= len do
+		local j = math.min(i + 199, len)
+		for _, b in { string.byte(s, i, j) } do
+			h1 = bit32.bxor(h1, b)
+			h1 = (h1 + bit32.lshift(h1, 1) + bit32.lshift(h1, 4) + bit32.lshift(h1, 7) + bit32.lshift(h1, 8) + bit32.lshift(h1, 24))
+				% 4294967296
+			h2 = (h2 * 33 + b) % 4294967296
+		end
+		i = j + 1
+	end
+	return string.format("%08x%08x", h1, h2)
+end
+
+-- Every place gets its own line of versions, named after the place.
+function Util.placeBranch(): string
+	return Util.safeName(game.Name)
+end
+
+local cachedAuthor: string?
+-- Yields the first time.
+function Util.author(): string
+	if not cachedAuthor then
+		local ok, name = pcall(function()
+			local id = game:GetService("StudioService"):GetUserId()
+			if id > 0 then
+				return game:GetService("Players"):GetNameFromUserIdAsync(id)
+			end
+			return nil
+		end)
+		cachedAuthor = if ok and name then name else "unknown"
+	end
+	return cachedAuthor :: string
+end
+
+function Util.timeText(t: number): string
+	local ok, text = pcall(function()
+		return DateTime.fromUnixTimestamp(t):FormatLocalTime("YYYY-MM-DD HH:mm", "en-us")
+	end)
+	return if ok then text else tostring(t)
+end
+
 local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local B64_DECODE = {}
 for i = 1, 64 do

@@ -1,5 +1,8 @@
 -- Immediate-mode panel: every state change rebuilds the view, which keeps theming and
 -- state handling trivial.
+local Diff = require(script.Parent.Diff)
+local Util = require(script.Parent.Util)
+
 local G = Enum.StudioStyleGuideColor
 
 local GREEN = Color3.fromRGB(76, 175, 80)
@@ -17,6 +20,7 @@ function UI.esc(s: string): string
 	out = out:gsub(">", "&gt;")
 	return out
 end
+local esc = UI.esc
 
 local function theme(c: Enum.StudioStyleGuideColor): Color3
 	return settings().Studio.Theme:GetColor(c)
@@ -143,12 +147,69 @@ local function listPaths(parent: Instance, title: string, color: Color3, paths: 
 	label(parent, `<b>{title}</b> ({#paths})`, { color = color })
 	local lines = {}
 	for i = 1, math.min(#paths, MAX_LISTED) do
-		table.insert(lines, "  " .. UI.esc(paths[i]))
+		table.insert(lines, "  " .. esc(paths[i]))
 	end
 	if #paths > MAX_LISTED then
 		table.insert(lines, `  ...and {#paths - MAX_LISTED} more`)
 	end
 	label(parent, table.concat(lines, "\n"), { size = 13, color = dim() })
+end
+
+local function listDiff(parent: Instance, d)
+	if d.total == 0 then
+		label(parent, "No changes to items.", { size = 13, color = dim() })
+		return
+	end
+	listPaths(parent, "New", GREEN, d.added)
+	listPaths(parent, "Changed", ORANGE, d.changed)
+	listPaths(parent, "Removed", RED, d.removed)
+end
+
+-- A text box. Re-rendering while it has focus would throw the text away, so render() waits.
+function UI:input(parent: Instance, placeholder: string, text: string, onChange: (string) -> ())
+	local t = Instance.new("TextBox")
+	t.Size = UDim2.new(1, 0, 0, 32)
+	t.ClearTextOnFocus = false
+	t.PlaceholderText = placeholder
+	t.Text = text
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.Font = Enum.Font.BuilderSans
+	t.TextSize = 15
+	t.BackgroundColor3 = theme(G.InputFieldBackground)
+	t.TextColor3 = theme(G.MainText)
+	t.PlaceholderColor3 = dim()
+	t.BorderSizePixel = 0
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 5)
+	corner.Parent = t
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = theme(G.InputFieldBorder)
+	stroke.Parent = t
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 8)
+	pad.PaddingRight = UDim.new(0, 8)
+	pad.Parent = t
+	t.Parent = parent
+
+	t:GetPropertyChangedSignal("Text"):Connect(function()
+		onChange(t.Text)
+	end)
+	t.Focused:Connect(function()
+		self.typing = true
+	end)
+	t.FocusLost:Connect(function()
+		self.typing = false
+		if self.pendingRender then
+			self.pendingRender = false
+			-- A click on a button also ends the typing; give it time to land first.
+			task.delay(0.25, function()
+				if not self.typing then
+					self:render()
+				end
+			end)
+		end
+	end)
+	return t
 end
 
 function UI.new(widget: DockWidgetPluginGui, handlers)
@@ -175,12 +236,50 @@ end
 
 function UI:selectionBlock(parent: Instance, buttonText: string)
 	local s = self.state.selection
-	label(parent, (if s.ok then "✓ " else "") .. UI.esc(s.message), { color = if s.ok then GREEN else dim(), size = 14 })
+	label(parent, (if s.ok then "✓ " else "") .. esc(s.message), { color = if s.ok then GREEN else dim(), size = 14 })
 	button(parent, buttonText, "primary", s.ok == true and not self.state.busy, self.handlers.onTrack)
+end
+
+function UI:mergeBlock(c: Instance, e)
+	local h = self.handlers
+	local p = e.pending
+	label(c, `<b>Combining "{esc(p.plan.theirsBranch)}" into "{esc(p.plan.ourBranch)}"</b>`)
+	label(c, "These items were changed in both places. Pick the one to keep for each:", { size = 14, color = dim() })
+	local all = true
+	for _, cf in p.plan.conflicts do
+		local path = Diff.path(if cf.ours then p.plan.oursTree else p.plan.theirsTree, cf.id)
+		local reason = if not cf.ours
+			then "deleted in yours, changed in theirs"
+			elseif not cf.theirs then "changed in yours, deleted in theirs"
+			else "changed in both"
+		label(c, `<b>{esc(path)}</b>  {reason}`, { size = 14 })
+		local choice = p.choices[cf.id]
+		if not choice then
+			all = false
+		end
+		local r = row(c)
+		button(r, "Keep mine", if choice == "ours" then "primary" else "secondary", true, function()
+			h.onChoose(e, cf.id, "ours")
+		end)
+		button(r, "Use theirs", if choice == "theirs" then "primary" else "secondary", true, function()
+			h.onChoose(e, cf.id, "theirs")
+		end)
+	end
+	local r = row(c)
+	button(r, "Finish combining", "primary", all and not e.busy, function()
+		h.onFinishMerge(e)
+	end)
+	button(r, "Cancel", "secondary", not e.busy, function()
+		h.onCancelMerge(e)
+	end)
 end
 
 function UI:trackedCard(parent: Instance, e)
 	local h = self.handlers
+	local dirty = e.status == "dirty"
+	local unsaved = e.status == "unsaved"
+	local idle = not e.busy
+
 	local color, text
 	if e.busy then
 		color, text = dim(), "Working..."
@@ -188,58 +287,143 @@ function UI:trackedCard(parent: Instance, e)
 		color, text = dim(), "Checking for changes..."
 	elseif e.status == "error" then
 		color, text = RED, "Couldn't check this folder: " .. tostring(e.error)
-	elseif e.status == "unsaved" then
-		color, text = ORANGE, "No snapshot yet. Press <b>Save snapshot</b> to keep a first copy."
+	elseif unsaved then
+		color, text = ORANGE, "No version saved yet. Press <b>Save version</b> to keep a first copy."
 	elseif e.status == "clean" then
-		color, text = GREEN, "Up to date. Matches the last snapshot."
+		color, text = GREEN, "Up to date. Matches your latest version."
 	else
-		color, text = ORANGE, plural(e.diff.total, "difference", "differences") .. " from the last snapshot."
+		color, text = ORANGE, plural(e.diff.total, "change", "changes") .. " since your latest version."
 	end
 
-	local c = card(parent, if e.status == "dirty" or e.status == "unsaved" then color else nil)
-	label(c, e.name, { size = 18, bold = true })
-	label(c, UI.esc(e.root:GetFullName()), { size = 12, color = dim() })
+	local c = card(parent, if dirty or unsaved then color else nil)
+	label(c, esc(e.name), { size = 18, bold = true })
+	label(c, esc(e.root:GetFullName()) .. "  ·  line: " .. esc(e.branch or "?"), { size = 12, color = dim() })
 	label(c, "● " .. text, { color = color })
 
-	local idle = not e.busy and (e.status == "dirty" or e.status == "unsaved")
+	if e.pending then
+		self:mergeBlock(c, e)
+		return
+	end
+
+	if idle and (dirty or unsaved) then
+		self:input(c, "What did you change? (optional)", e.message or "", function(t)
+			e.message = t
+		end)
+	end
 	local buttons = row(c)
-	button(buttons, "Save snapshot", "primary", idle, function()
-		h.onSnapshot(e)
+	button(buttons, "Save version", "primary", idle and (dirty or unsaved), function()
+		h.onSave(e)
 	end)
-	if e.status == "dirty" then
-		button(buttons, if e.showChanges then "Hide differences" else "See differences", "secondary", not e.busy, function()
+	if dirty then
+		button(buttons, if e.showChanges then "Hide changes" else "See changes", "secondary", idle, function()
 			h.onToggleChanges(e)
 		end)
-		button(buttons, "Restore snapshot", "secondary", not e.busy and not e.confirmRestore, function()
-			h.onAskRestore(e)
+		button(buttons, "Discard changes", "secondary", idle and not e.confirmDiscard, function()
+			h.onAskDiscard(e)
 		end)
 	end
 
-	if e.confirmRestore then
+	if e.confirmDiscard then
 		label(
 			c,
-			"<b>Replace this folder with the last snapshot?</b>\nEverything you changed since then is lost. You can still undo with Ctrl+Z.",
+			"<b>Throw away your changes and go back to the latest version?</b>\nYou can still undo with Ctrl+Z.",
 			{ color = ORANGE, size = 14 }
 		)
-		local confirm = row(c)
-		button(confirm, "Yes, restore", "danger", true, function()
-			h.onRestore(e)
+		local r = row(c)
+		button(r, "Yes, discard", "danger", true, function()
+			h.onDiscard(e)
 		end)
-		button(confirm, "Cancel", "secondary", true, function()
-			h.onCancelRestore(e)
+		button(r, "Cancel", "secondary", true, function()
+			h.onCancelDiscard(e)
 		end)
 	end
 
-	if e.showChanges and e.status == "dirty" then
+	if e.showChanges and dirty then
 		listPaths(c, "New in your folder", GREEN, e.diff.added)
 		listPaths(c, "Changed", ORANGE, e.diff.changed)
 		listPaths(c, "Missing from your folder", RED, e.diff.removed)
+	end
+
+	if not unsaved then
+		local more = row(c)
+		button(more, if e.showHistory then "Hide history" else "History", "secondary", idle, function()
+			h.onToggleHistory(e)
+		end)
+		if #e.others > 0 then
+			button(more, if e.showCombine then "Hide combine" else "Combine with another line", "secondary", idle, function()
+				h.onToggleCombine(e)
+			end)
+		end
+		button(more, "Export to file", "secondary", idle, function()
+			h.onExport(e)
+		end)
+	end
+
+	if e.showHistory then
+		label(c, "<b>History</b> (latest first)")
+		for i, m in e.history do
+			label(
+				c,
+				`<b>{esc(m.message)}</b>{if i == 1 then "  (latest)" else ""}\n{esc(m.author)} · {Util.timeText(m.time)}`,
+				{ size = 14 }
+			)
+			local r = row(c)
+			button(r, if e.openVersion == m.id then "Hide changes" else "What changed", "secondary", idle, function()
+				h.onOpenVersion(e, m.id)
+			end)
+			button(r, "Go back to this", "secondary", idle and e.confirmGoTo ~= m.id, function()
+				h.onAskGoTo(e, m.id)
+			end)
+			if e.openVersion == m.id and e.versionDiff then
+				listDiff(c, e.versionDiff)
+			end
+			if e.confirmGoTo == m.id then
+				label(
+					c,
+					"<b>Replace this folder with that version?</b>\nUnsaved changes are lost. You can still undo with Ctrl+Z, and your saved versions stay.",
+					{ color = ORANGE, size = 14 }
+				)
+				local confirm = row(c)
+				button(confirm, "Yes, go back", "danger", true, function()
+					h.onGoTo(e, m.id)
+				end)
+				button(confirm, "Cancel", "secondary", true, function()
+					h.onCancelGoTo(e)
+				end)
+			end
+		end
+	end
+
+	if e.showCombine then
+		label(c, "<b>Combine</b>")
+		label(c, "Bring the work from another place or line into this folder.", { size = 14, color = dim() })
+		if e.status ~= "clean" then
+			label(c, "Save a version first, so nothing you did is lost.", { size = 14, color = ORANGE })
+		end
+		for _, o in e.others do
+			label(
+				c,
+				`<b>{esc(o.name)}</b>\nlatest: {esc(o.meta.message)} · {esc(o.meta.author)} · {Util.timeText(o.meta.time)}`,
+				{ size = 14 }
+			)
+			if o.included then
+				label(c, "Already included in your folder.", { size = 13, color = dim() })
+			else
+				button(c, "Combine into mine", "primary", e.status == "clean" and idle, function()
+					h.onMerge(e, o.name)
+				end)
+			end
+		end
 	end
 end
 
 function UI:render()
 	local s = self.state
 	if not s then
+		return
+	end
+	if self.typing then
+		self.pendingRender = true
 		return
 	end
 	local scroll = self.scroll
@@ -255,7 +439,7 @@ function UI:render()
 	label(scroll, "Asset Versioning", { size = 22, bold = true })
 	label(
 		scroll,
-		"Keeps a history of your asset folders so your team can see what changed, go back, and merge work from different places.",
+		"Keeps a history of your asset folders so you can see what changed, go back, and combine work from different places.",
 		{ color = dim(), size = 14 }
 	)
 
@@ -272,7 +456,7 @@ function UI:render()
 		local c = card(scroll)
 		label(c, "Let's get started", { size = 18, bold = true })
 		label(c, "<b>1.</b>  In the Explorer, click the folder that holds your assets (for example <i>Props</i>).")
-		label(c, "<b>2.</b>  Press the button below. We save the first snapshot for you.")
+		label(c, "<b>2.</b>  Press the button below. We save the first version for you.")
 		self:selectionBlock(c, "Track this folder")
 	end
 
@@ -282,11 +466,15 @@ function UI:render()
 
 	if #s.available > 0 then
 		local c = card(scroll)
-		label(c, "Found in your project", { size = 18, bold = true })
-		label(c, "These asset folders are saved in the project but aren't in this place yet.", { color = dim(), size = 14 })
+		label(c, "Saved folders not in this place", { size = 18, bold = true })
+		label(
+			c,
+			"These folders have saved versions here (for example from an imported file) but aren't in the Explorer yet.",
+			{ color = dim(), size = 14 }
+		)
 		for _, name in s.available do
 			local r = row(c)
-			label(r, name, { bold = true }).Size = UDim2.new(1, -150, 0, 32)
+			label(r, esc(name), { bold = true }).Size = UDim2.new(1, -150, 0, 32)
 			button(r, "Add to this place", "primary", not s.busy, function()
 				self.handlers.onLoad(name)
 			end)
@@ -303,9 +491,10 @@ function UI:render()
 	label(share, "Sharing with your team", { size = 16, bold = true })
 	label(
 		share,
-		"After <b>Save snapshot</b>:\n<b>1.</b>  Save your place (Ctrl+S).\n<b>2.</b>  Double-click <b>Save Versions.bat</b> in your project folder.\n<b>3.</b>  Teammates get your changes, then press <b>Restore snapshot</b> here.",
+		"<b>Same Team Create place:</b> nothing to do, everyone sees the same history.\n<b>Different places:</b> press <b>Export to file</b> on a folder, open the other place, press <b>Import a file</b> below, then use <b>Combine</b>.\nOnly import files from people you trust.",
 		{ size = 14 }
 	)
+	button(share, "Import a file", "secondary", not s.busy, self.handlers.onImport)
 
 	task.defer(function()
 		scroll.CanvasPosition = position

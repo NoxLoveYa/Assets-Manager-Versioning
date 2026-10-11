@@ -208,4 +208,34 @@ function Serializer.render(node): string
 	return table.concat(out, "\n") .. "\n"
 end
 
+-- Inverse of render: turns a loaded snapshot module back into a node (used when merging).
+function Serializer.nodeFromData(data)
+	local function enc(v: any): string?
+		if type(v) == "table" and v.ref then
+			return "{ ref = " .. quote(v.ref) .. " }"
+		end
+		return Codec.encode(v)
+	end
+	local node = {
+		id = data.id,
+		parentId = data.parent,
+		location = data.location,
+		class = data.class,
+		name = data.name,
+		props = {},
+		attrs = {},
+		tags = table.clone(data.tags or {}),
+		source = data.source,
+		blob = data.blob,
+	}
+	for k, v in data.props or {} do
+		node.props[k] = enc(v)
+	end
+	for k, v in data.attributes or {} do
+		node.attrs[k] = enc(v)
+	end
+	table.sort(node.tags)
+	return node
+end
+
 return Serializer

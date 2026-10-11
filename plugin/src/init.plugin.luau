@@ -2,8 +2,9 @@ local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local Selection = game:GetService("Selection")
 
+local Bundle = require(script.Bundle)
+local Repo = require(script.Repo)
 local Restore = require(script.Restore)
-local Snapshot = require(script.Snapshot)
 local Status = require(script.Status)
 local Store = require(script.Store)
 local UI = require(script.UI)
@@ -15,7 +16,7 @@ local toolbar = plugin:CreateToolbar("Asset Versioning")
 local toggle = toolbar:CreateButton("Versioning", "Save, compare and restore your asset folders", "", "Versioning")
 toggle.ClickableWhenViewportHidden = true
 
-local widget = plugin:CreateDockWidgetPluginGui(
+local widget = plugin:CreateDockWidgetPluginGuiAsync(
 	"AssetVersioning",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Left, false, false, 360, 600, 300, 300)
 )
@@ -57,7 +58,7 @@ local function refreshList()
 
 	state.tracked = {}
 	for name, root in roots do
-		local e = entries[name] or { name = name, status = "checking" }
+		local e = entries[name] or { name = name, status = "checking", history = {}, others = {}, message = "" }
 		e.root = root
 		entries[name] = e
 		table.insert(state.tracked, e)
@@ -83,15 +84,26 @@ local function check(e)
 	e.token = (e.token or 0) + 1
 	local mine = e.token
 	task.spawn(function()
-		local ok, result = pcall(Status.compute, e.root, e.name)
+		local ok, result = pcall(function()
+			local diff = Status.compute(e.root, e.name)
+			local branch, tip = Repo.current(e.name)
+			return {
+				diff = diff,
+				branch = branch,
+				tip = tip,
+				history = Repo.history(e.name, tip, 15),
+				others = Repo.others(e.name, branch, tip),
+			}
+		end)
 		if e.token ~= mine or e.busy then
 			return
 		end
 		if ok then
-			e.diff = result
-			e.status = if result.stored == 0 then "unsaved" elseif result.total == 0 then "clean" else "dirty"
+			e.diff, e.branch, e.tip, e.history, e.others = result.diff, result.branch, result.tip, result.history, result.others
+			e.status = if not result.diff.versions then "unsaved" elseif result.diff.total == 0 then "clean" else "dirty"
 			if e.status ~= "dirty" then
 				e.showChanges = false
+				e.confirmDiscard = false
 			end
 		else
 			e.status = "error"
@@ -101,6 +113,12 @@ local function check(e)
 	end)
 end
 
+local function checkAll()
+	for _, e in state.tracked do
+		check(e)
+	end
+end
+
 local recheckToken = 0
 local function recheckSoon(delaySeconds: number?)
 	recheckToken += 1
@@ -108,7 +126,7 @@ local function recheckSoon(delaySeconds: number?)
 	task.delay(delaySeconds or 0.8, function()
 		if mine == recheckToken and widget.Enabled then
 			for _, e in state.tracked do
-				if not e.busy then
+				if not e.busy and not e.pending then
 					check(e)
 				end
 			end
@@ -120,9 +138,9 @@ local function validate(inst: Instance): (boolean, string)
 	if inst.Parent == game or inst == game then
 		return false, "Pick a folder inside a service, not the service itself."
 	end
-	local store = Store.folder()
+	local store = Store.root()
 	if store and (inst == store or inst:IsDescendantOf(store)) then
-		return false, "That's where snapshots are stored. Pick your asset folder instead."
+		return false, "That's where versions are stored. Pick your asset folder instead."
 	end
 	if CollectionService:HasTag(inst, Util.ROOT_TAG) then
 		return false, inst.Name .. " is already tracked."
@@ -154,25 +172,6 @@ local function updateSelection()
 	end
 end
 
-local function snapshot(e)
-	e.busy = true
-	e.confirmRestore = false
-	render()
-	task.spawn(function()
-		local result = Snapshot.save(e.root, e.name)
-		e.busy = false
-		if result.ok then
-			toast(
-				`Snapshot of "{esc(e.name)}" saved. Now save your place (Ctrl+S) and double-click Save Versions.bat.`,
-				"success"
-			)
-		else
-			toast(esc(result.message), "error")
-		end
-		check(e)
-	end)
-end
-
 local function describeProblems(result, doneText: string)
 	local text = doneText
 	if #result.failures > 0 then
@@ -183,27 +182,103 @@ local function describeProblems(result, doneText: string)
 		text ..= `\n\n{#result.failures} setting(s) could not be applied, for example: {table.concat(shown, ", ")}.`
 	end
 	if #result.unreadable > 0 then
-		text ..= `\n\n{#result.unreadable} snapshot file(s) could not be read: {esc(table.concat(result.unreadable, ", "))}. Check the project for merge conflicts.`
+		text ..= `\n\n{#result.unreadable} saved item(s) could not be read: {esc(table.concat(result.unreadable, ", "))}.`
 	end
 	return text, if #result.failures > 0 or #result.unreadable > 0 then "info" else "success"
 end
 
-local function restore(e)
+local function save(e)
 	e.busy = true
-	e.confirmRestore = false
+	e.confirmDiscard = false
 	render()
 	task.spawn(function()
-		local result = Restore.run(e.name, e.root)
+		local result = Repo.save(e.root, e.name, e.message or "")
 		e.busy = false
 		if result.ok then
-			local text, kind = describeProblems(result, `"{esc(e.name)}" now matches the last snapshot.`)
+			e.message = ""
+			toast(`Version of "{esc(e.name)}" saved.`, "success")
+		elseif result.nothing then
+			toast(result.message, "info")
+		else
+			toast(esc(result.message), "error")
+		end
+		check(e)
+	end)
+end
+
+-- Makes the live folder match `tree`.
+local function applyTree(e, tree, doneText: string)
+	e.busy = true
+	e.confirmDiscard = false
+	e.confirmGoTo = nil
+	render()
+	task.spawn(function()
+		local result = Restore.run(e.name, e.root, tree)
+		e.busy = false
+		if result.ok then
+			local text, kind = describeProblems(result, doneText)
 			toast(text, kind)
 		else
 			toast(esc(result.message), "error")
 		end
 		refreshList()
-		for _, other in state.tracked do
-			check(other)
+		checkAll()
+	end)
+end
+
+local function finishMerge(e, plan, choices)
+	e.busy = true
+	render()
+	task.spawn(function()
+		local ok, res = pcall(function()
+			if plan.kind == "fastforward" then
+				return Repo.fastForward(e.name, plan)
+			end
+			return Repo.finishMerge(e.name, plan, choices)
+		end)
+		if not ok then
+			e.busy, e.pending = false, nil
+			toast("Combining failed, nothing was changed: " .. esc(tostring(res)), "error")
+			check(e)
+			return
+		end
+		local restored = Restore.run(e.name, e.root, res.tree)
+		e.busy, e.pending, e.showCombine = false, nil, false
+		if restored.ok then
+			local done = `Combined "{esc(plan.theirsBranch)}" into "{esc(plan.ourBranch)}".`
+			if res.dropped > 0 then
+				done ..= `\n{res.dropped} item(s) were left out because their folder was deleted on one side.`
+			end
+			local text, kind = describeProblems(restored, done)
+			toast(text, kind)
+		else
+			toast("The versions were combined but the folder couldn't be updated: " .. esc(restored.message), "error")
+		end
+		refreshList()
+		checkAll()
+	end)
+end
+
+local function startMerge(e, theirsBranch: string)
+	e.busy = true
+	render()
+	task.spawn(function()
+		local ok, plan = pcall(Repo.planMerge, e.name, theirsBranch)
+		e.busy = false
+		if not ok then
+			toast("Couldn't combine: " .. esc(tostring(plan)), "error")
+			check(e)
+		elseif plan.kind == "error" then
+			toast(esc(plan.message), "error")
+			check(e)
+		elseif plan.kind == "noop" then
+			toast("Everything from that line is already in your folder.", "info")
+			check(e)
+		elseif plan.kind == "plan" and #plan.conflicts > 0 then
+			e.pending = { plan = plan, choices = {} }
+			render()
+		else
+			finishMerge(e, plan, {})
 		end
 	end)
 end
@@ -212,18 +287,22 @@ local function load(name: string)
 	state.busy = true
 	render()
 	task.spawn(function()
-		local result = Restore.run(name, nil)
+		local ok, result = pcall(function()
+			local tree = Repo.adopt(name)
+			if not tree then
+				return { ok = false, message = "That folder's history could not be read." }
+			end
+			return Restore.run(name, nil, tree)
+		end)
 		state.busy = false
-		if result.ok then
+		if ok and result.ok then
 			local text, kind = describeProblems(result, `"{esc(name)}" was added to this place.`)
 			toast(text, kind)
 		else
-			toast(esc(result.message), "error")
+			toast(esc(if ok then result.message else tostring(result)), "error")
 		end
 		refreshList()
-		for _, e in state.tracked do
-			check(e)
-		end
+		checkAll()
 	end)
 end
 
@@ -233,7 +312,7 @@ local function track()
 		return
 	end
 	local pkg = Util.safeName(inst.Name)
-	if entries[pkg] or Store.packageFolder(pkg) then
+	if entries[pkg] or Store.pkg(pkg) then
 		toast(`There is already a tracked folder called "{esc(pkg)}". Rename yours first so they don't get mixed up.`, "error")
 		return
 	end
@@ -249,26 +328,113 @@ local function track()
 	updateSelection()
 	local e = entries[pkg]
 	if e then
-		snapshot(e)
+		e.message = "First version"
+		save(e)
 	end
+end
+
+local function exportFile(e)
+	task.spawn(function()
+		local result = Bundle.export(plugin, e.name)
+		if not result.cancelled then
+			toast(esc(result.message), if result.ok then "success" else "error")
+		end
+	end)
+end
+
+local function importFile()
+	state.busy = true
+	render()
+	task.spawn(function()
+		local result = Bundle.import()
+		state.busy = false
+		if result.ok then
+			local lines = {}
+			for _, i in result.imported do
+				table.insert(lines, `"{esc(i.name)}": {i.versions} new version(s)`)
+			end
+			toast("Imported. " .. table.concat(lines, ", ") .. ".\nUse Combine on a folder, or Add to this place below.", "success")
+		elseif result.cancelled then
+			render()
+		else
+			toast(esc(result.message), "error")
+		end
+		refreshList()
+		checkAll()
+	end)
 end
 
 ui = UI.new(widget, {
 	onTrack = track,
-	onSnapshot = snapshot,
-	onRestore = restore,
+	onSave = save,
 	onLoad = load,
+	onExport = exportFile,
+	onImport = importFile,
 	onToggleChanges = function(e)
 		e.showChanges = not e.showChanges
 		render()
 	end,
-	onAskRestore = function(e)
-		e.confirmRestore = true
+	onAskDiscard = function(e)
+		e.confirmDiscard = true
 		render()
 	end,
-	onCancelRestore = function(e)
-		e.confirmRestore = false
+	onCancelDiscard = function(e)
+		e.confirmDiscard = false
 		render()
+	end,
+	onDiscard = function(e)
+		local tree = if e.tip then Store.tree(e.name, e.tip) else nil
+		if tree then
+			applyTree(e, tree, `"{esc(e.name)}" is back to its latest version.`)
+		else
+			toast("The latest version could not be read.", "error")
+		end
+	end,
+	onToggleHistory = function(e)
+		e.showHistory = not e.showHistory
+		e.openVersion, e.versionDiff, e.confirmGoTo = nil, nil, nil
+		render()
+	end,
+	onOpenVersion = function(e, id)
+		if e.openVersion == id then
+			e.openVersion, e.versionDiff = nil, nil
+		else
+			e.openVersion, e.versionDiff = id, Repo.describeVersion(e.name, id)
+		end
+		render()
+	end,
+	onAskGoTo = function(e, id)
+		e.confirmGoTo = id
+		render()
+	end,
+	onCancelGoTo = function(e)
+		e.confirmGoTo = nil
+		render()
+	end,
+	onGoTo = function(e, id)
+		local tree = Store.tree(e.name, id)
+		if tree then
+			applyTree(e, tree, `"{esc(e.name)}" now matches that version. Press Save version to keep it as the newest.`)
+		else
+			toast("That version could not be read.", "error")
+		end
+	end,
+	onToggleCombine = function(e)
+		e.showCombine = not e.showCombine
+		render()
+	end,
+	onMerge = startMerge,
+	onChoose = function(e, id, side)
+		e.pending.choices[id] = side
+		render()
+	end,
+	onFinishMerge = function(e)
+		finishMerge(e, e.pending.plan, e.pending.choices)
+	end,
+	onCancelMerge = function(e)
+		e.pending = nil
+		render()
+		check(e)
 	end,
 	onDismissToast = function()
 		state.toast = nil
@@ -323,7 +489,7 @@ ChangeHistoryService.OnRedo:Connect(function()
 	recheckSoon()
 end)
 
--- Rojo (git pulls, merges) rewrites snapshot files without any undo step, so watch for that.
+-- Teammates (Team Create) can add versions at any time, so watch for that.
 task.spawn(function()
 	local last = Store.signature()
 	while true do
